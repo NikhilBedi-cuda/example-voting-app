@@ -1,0 +1,105 @@
+name: Build & Sysdig Scan (vote/worker/result)
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # needed to upload SARIF
+
+env:
+  # Change this if you want ACR/ECR/etc. Example uses GHCR.
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: vote
+            context: ./vote
+            dockerfile: ./vote/Dockerfile
+          - name: worker
+            context: ./worker
+            dockerfile: ./worker/Dockerfile
+          - name: result
+            context: ./result
+            dockerfile: ./result/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Optional: login only if you push images (main branch). Safe for PRs.
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ github.event.repository.name }}-${{ matrix.service.name }}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "tag_sha=${IMAGE}:${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "tag_latest=${IMAGE}:latest" >> $GITHUB_OUTPUT
+
+      # Build the image locally so Sysdig scanner can analyze it on the runner.
+      - name: Build image (local)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
+          load: true
+          tags: ${{ steps.meta.outputs.tag_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sysdig Scan Action: wraps sysdig-cli-scanner, verifies checksum, and can emit SARIF.
+      - name: Sysdig scan (VM mode)
+        id: sysdig_scan
+        uses: sysdiglabs/scan-action@v6
+        with:
+          image-tag: ${{ steps.meta.outputs.tag_sha }}
+          sysdig-secure-token: ${{ secrets.SYSDIG_SECURE_TOKEN }}
+          sysdig-secure-url: ${{ secrets.SYSDIG_SECURE_URL }}
+          # Hardening options (uncomment as needed):
+          stop-on-failed-policy-eval: true
+          stop-on-processing-error: true
+          # Example filters:
+          # severity-at-least: high
+          # use-policies: '\"Sysdig Best Practices\", my-team-policy'
+
+      # Upload SARIF to GitHub code scanning UI.
+      - name: Upload SARIF
+        if: success() || failure()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ github.workspace }}/sarif.json
+
+      # Optional: push on main after scan passes.
+      - name: Push image (main only)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tag_sha }}
+            ${{ steps.meta.outputs.tag_latest }}
+          cache-from: type=gha
+``
